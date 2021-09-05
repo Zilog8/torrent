@@ -174,7 +174,9 @@ type VersionCmd struct{}
 type SpewBencodingCmd struct{}
 
 type DownloadCmd struct {
-	Mmap               bool           `help:"memory-map torrent data"`
+	Mmap               bool           `help:"Use memory-mapped files to store torrent data"`
+	LocalCacheDir      string         `help:"Use provided local directory to cache torrent data"`
+	LocalCacheSize     uint64         `help:"Max size in bytes for local cache. Give 0 for infinite." default:0`
 	TestPeer           []string       `help:"addresses of some starting peers"`
 	Seed               bool           `help:"seed after download is complete"`
 	Addr               string         `help:"network listen addr"`
@@ -200,6 +202,7 @@ type DownloadCmd struct {
 
 	File    []string
 	Torrent []string `arity:"+" help:"torrent file path or magnet uri" arg:"positional"`
+	Path    string   `help:"Set a Path or URI to download to" default:"."`
 }
 
 type ListFilesCmd struct {
@@ -309,6 +312,12 @@ func downloadErr() error {
 	}
 	if flags.Mmap {
 		clientConfig.DefaultStorage = storage.NewMMap("")
+	} else {
+		clientConfig.DefaultStorage = storage.NewFile(flags.Path)
+	}
+
+	if flags.LocalCacheDir != "" {
+		clientConfig.DefaultStorage = storage.NewLocalCache(flags.LocalCacheDir, flags.LocalCacheSize, clientConfig.DefaultStorage)
 	}
 	if flags.Addr != "" {
 		clientConfig.SetListenAddr(flags.Addr)
