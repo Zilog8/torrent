@@ -21,7 +21,6 @@ import (
 	"github.com/anacrolix/chansync"
 	"github.com/anacrolix/dht/v2"
 	"github.com/anacrolix/log"
-	"github.com/anacrolix/missinggo/iter"
 	"github.com/anacrolix/missinggo/perf"
 	"github.com/anacrolix/missinggo/pubsub"
 	"github.com/anacrolix/missinggo/slices"
@@ -66,7 +65,7 @@ type Torrent struct {
 	// The size of chunks to request from peers over the wire. This is
 	// normally 16KiB by convention these days.
 	chunkSize pp.Integer
-	chunkPool *sync.Pool
+	chunkPool sync.Pool
 	// Total length of the torrent in bytes. Stored because it's not O(1) to
 	// get this from the info dict.
 	length *int64
@@ -122,8 +121,8 @@ type Torrent struct {
 	metadataCompletedChunks []bool
 	metadataChanged         sync.Cond
 
-	// Set when .Info is obtained.
-	gotMetainfo missinggo.Event
+	// Closed when .Info is obtained.
+	gotMetainfoC chan struct{}
 
 	readers                map[*reader]struct{}
 	_readerNowPieces       bitmap.Bitmap
@@ -144,7 +143,9 @@ type Torrent struct {
 	connPieceInclinationPool sync.Pool
 
 	// Count of each request across active connections.
-	pendingRequests map[Request]int
+	pendingRequests map[RequestIndex]int
+	// Chunks we've written to since the corresponding piece was last checked.
+	dirtyChunks roaring.Bitmap
 
 	pex pexState
 }
@@ -233,7 +234,7 @@ func (t *Torrent) KnownSwarm() (ks []PeerInfo) {
 
 func (t *Torrent) setChunkSize(size pp.Integer) {
 	t.chunkSize = size
-	t.chunkPool = &sync.Pool{
+	t.chunkPool = sync.Pool{
 		New: func() interface{} {
 			b := make([]byte, size)
 			return &b
@@ -263,14 +264,13 @@ func (t *Torrent) addrActive(addr string) bool {
 	return false
 }
 
-func (t *Torrent) unclosedConnsAsSlice() (ret []*PeerConn) {
-	ret = make([]*PeerConn, 0, len(t.conns))
+func (t *Torrent) appendUnclosedConns(ret []*PeerConn) []*PeerConn {
 	for c := range t.conns {
 		if !c.closed.IsSet() {
 			ret = append(ret, c)
 		}
 	}
-	return
+	return ret
 }
 
 func (t *Torrent) addPeer(p PeerInfo) (added bool) {
@@ -306,10 +306,11 @@ func (t *Torrent) addPeer(p PeerInfo) (added bool) {
 }
 
 func (t *Torrent) invalidateMetadata() {
-	for i := range t.metadataCompletedChunks {
+	for i := 0; i < len(t.metadataCompletedChunks); i++ {
 		t.metadataCompletedChunks[i] = false
 	}
 	t.nameMu.Lock()
+	t.gotMetainfoC = make(chan struct{})
 	t.info = nil
 	t.nameMu.Unlock()
 }
@@ -439,9 +440,9 @@ func (t *Torrent) onSetInfo() {
 		}
 	}
 	t.cl.event.Broadcast()
-	t.gotMetainfo.Set()
+	close(t.gotMetainfoC)
 	t.updateWantPeersEvent()
-	t.pendingRequests = make(map[Request]int)
+	t.pendingRequests = make(map[RequestIndex]int)
 	t.tryCreateMorePieceHashers()
 }
 
@@ -482,19 +483,19 @@ func (t *Torrent) haveAllMetadataPieces() bool {
 }
 
 // TODO: Propagate errors to disconnect peer.
-func (t *Torrent) setMetadataSize(bytes int) (err error) {
+func (t *Torrent) setMetadataSize(size int) (err error) {
 	if t.haveInfo() {
 		// We already know the correct metadata size.
 		return
 	}
-	if bytes <= 0 || bytes > 10000000 { // 10MB, pulled from my ass.
+	if uint32(size) > maxMetadataSize {
 		return errors.New("bad size")
 	}
-	if t.metadataBytes != nil && len(t.metadataBytes) == int(bytes) {
+	if len(t.metadataBytes) == size {
 		return
 	}
-	t.metadataBytes = make([]byte, bytes)
-	t.metadataCompletedChunks = make([]bool, (bytes+(1<<14)-1)/(1<<14))
+	t.metadataBytes = make([]byte, size)
+	t.metadataCompletedChunks = make([]bool, (size+(1<<14)-1)/(1<<14))
 	t.metadataChanged.Broadcast()
 	for c := range t.conns {
 		c.requestPendingMetadata()
@@ -843,12 +844,18 @@ func (t *Torrent) bitfield() (bf []bool) {
 	return
 }
 
-func (t *Torrent) pieceNumChunks(piece pieceIndex) pp.Integer {
-	return (t.pieceLength(piece) + t.chunkSize - 1) / t.chunkSize
+func (t *Torrent) pieceNumChunks(piece pieceIndex) chunkIndexType {
+	return chunkIndexType((t.pieceLength(piece) + t.chunkSize - 1) / t.chunkSize)
+}
+
+func (t *Torrent) chunksPerRegularPiece() uint32 {
+	return uint32((pp.Integer(t.usualPieceSize()) + t.chunkSize - 1) / t.chunkSize)
 }
 
 func (t *Torrent) pendAllChunkSpecs(pieceIndex pieceIndex) {
-	t.pieces[pieceIndex]._dirtyChunks.Clear()
+	t.dirtyChunks.RemoveRange(
+		uint64(t.pieceRequestIndexOffset(pieceIndex)),
+		uint64(t.pieceRequestIndexOffset(pieceIndex+1)))
 }
 
 func (t *Torrent) pieceLength(piece pieceIndex) pp.Integer {
@@ -941,8 +948,8 @@ func (t *Torrent) haveChunk(r Request) (ret bool) {
 	return !p.pendingChunk(r.ChunkSpec, t.chunkSize)
 }
 
-func chunkIndex(cs ChunkSpec, chunkSize pp.Integer) int {
-	return int(cs.Begin / chunkSize)
+func chunkIndexFromChunkSpec(cs ChunkSpec, chunkSize pp.Integer) chunkIndexType {
+	return chunkIndexType(cs.Begin / chunkSize)
 }
 
 func (t *Torrent) wantPieceIndex(index pieceIndex) bool {
@@ -974,11 +981,25 @@ func (t *Torrent) wantPieceIndex(index pieceIndex) bool {
 	})
 }
 
+// A pool of []*PeerConn, to reduce allocations in functions that need to index or sort Torrent
+// conns (which is a map).
+var peerConnSlices sync.Pool
+
 // The worst connection is one that hasn't been sent, or sent anything useful for the longest. A bad
-// connection is one that usually sends us unwanted pieces, or has been in worser half of the
-// established connections for more than a minute.
-func (t *Torrent) worstBadConn() *PeerConn {
-	wcs := worseConnSlice{t.unclosedConnsAsSlice()}
+// connection is one that usually sends us unwanted pieces, or has been in the worse half of the
+// established connections for more than a minute. This is O(n log n). If there was a way to not
+// consider the position of a conn relative to the total number, it could be reduced to O(n).
+func (t *Torrent) worstBadConn() (ret *PeerConn) {
+	var sl []*PeerConn
+	getInterface := peerConnSlices.Get()
+	if getInterface == nil {
+		sl = make([]*PeerConn, 0, len(t.conns))
+	} else {
+		sl = getInterface.([]*PeerConn)[:0]
+	}
+	sl = t.appendUnclosedConns(sl)
+	defer peerConnSlices.Put(sl)
+	wcs := worseConnSlice{sl}
 	heap.Init(&wcs)
 	for wcs.Len() != 0 {
 		c := heap.Pop(&wcs).(*PeerConn)
@@ -1020,11 +1041,11 @@ func (t *Torrent) pieceNumPendingChunks(piece pieceIndex) pp.Integer {
 	if t.pieceComplete(piece) {
 		return 0
 	}
-	return t.pieceNumChunks(piece) - t.pieces[piece].numDirtyChunks()
+	return pp.Integer(t.pieceNumChunks(piece) - t.pieces[piece].numDirtyChunks())
 }
 
 func (t *Torrent) pieceAllDirty(piece pieceIndex) bool {
-	return t.pieces[piece]._dirtyChunks.Len() == bitmap.BitRange(t.pieceNumChunks(piece))
+	return t.pieces[piece].allChunksDirty()
 }
 
 func (t *Torrent) readersChanged() {
@@ -1157,9 +1178,8 @@ func (t *Torrent) piecePriority(piece pieceIndex) piecePriority {
 	return ret
 }
 
-func (t *Torrent) pendRequest(req Request) {
-	ci := chunkIndex(req.ChunkSpec, t.chunkSize)
-	t.pieces[req.Index].pendChunkIndex(ci)
+func (t *Torrent) pendRequest(req RequestIndex) {
+	t.piece(int(req / t.chunksPerRegularPiece())).pendChunkIndex(req % t.chunksPerRegularPiece())
 }
 
 func (t *Torrent) pieceCompletionChanged(piece pieceIndex) {
@@ -2223,7 +2243,7 @@ func (t *Torrent) addWebSeed(url string) {
 		activeRequests: make(map[Request]webseed.Request, maxRequests),
 	}
 	ws.requesterCond.L = t.cl.locker()
-	for range iter.N(maxRequests) {
+	for i := 0; i < maxRequests; i += 1 {
 		go ws.requester()
 	}
 	for _, f := range t.callbacks().NewPeer {
@@ -2245,4 +2265,24 @@ func (t *Torrent) peerIsActive(p *Peer) (active bool) {
 		}
 	})
 	return
+}
+
+func (t *Torrent) requestIndexToRequest(ri RequestIndex) Request {
+	index := ri / t.chunksPerRegularPiece()
+	return Request{
+		pp.Integer(index),
+		t.piece(int(index)).chunkIndexSpec(ri % t.chunksPerRegularPiece()),
+	}
+}
+
+func (t *Torrent) requestIndexFromRequest(r Request) RequestIndex {
+	return t.pieceRequestIndexOffset(pieceIndex(r.Index)) + uint32(r.Begin/t.chunkSize)
+}
+
+func (t *Torrent) numChunks() RequestIndex {
+	return RequestIndex((t.Length() + int64(t.chunkSize) - 1) / int64(t.chunkSize))
+}
+
+func (t *Torrent) pieceRequestIndexOffset(piece pieceIndex) RequestIndex {
+	return RequestIndex(piece) * t.chunksPerRegularPiece()
 }

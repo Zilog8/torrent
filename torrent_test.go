@@ -10,7 +10,6 @@ import (
 
 	"github.com/anacrolix/missinggo/v2"
 	"github.com/anacrolix/missinggo/v2/bitmap"
-	"github.com/bradfitz/iter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -91,7 +90,7 @@ func BenchmarkUpdatePiecePriorities(b *testing.B) {
 		Length:      pieceLength * numPieces,
 	}))
 	assert.EqualValues(b, 13410, t.numPieces())
-	for range iter.N(7) {
+	for i := 0; i < 7; i += 1 {
 		r := t.NewReader()
 		r.SetReadahead(32 << 20)
 		r.Seek(3500000, io.SeekStart)
@@ -101,7 +100,7 @@ func BenchmarkUpdatePiecePriorities(b *testing.B) {
 		t._completedPieces.Add(bitmap.BitIndex(i))
 	}
 	t.DownloadPieces(0, t.numPieces())
-	for range iter.N(b.N) {
+	for i := 0; i < b.N; i += 1 {
 		t.updateAllPiecePriorities()
 	}
 }
@@ -149,7 +148,9 @@ func TestPieceHashFailed(t *testing.T) {
 	tt.setChunkSize(2)
 	require.NoError(t, tt.setInfoBytesLocked(mi.InfoBytes))
 	tt.cl.lock()
-	tt.pieces[1]._dirtyChunks.AddRange(0, 3)
+	tt.dirtyChunks.AddRange(
+		uint64(tt.pieceRequestIndexOffset(1)),
+		uint64(tt.pieceRequestIndexOffset(1)+3))
 	require.True(t, tt.pieceAllDirty(1))
 	tt.pieceHashed(1, false, nil)
 	// Dirty chunks should be cleared so we can try again.

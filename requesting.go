@@ -4,12 +4,15 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/RoaringBitmap/roaring"
 	"github.com/anacrolix/missinggo/v2/bitmap"
 
 	"github.com/anacrolix/chansync"
 	request_strategy "github.com/anacrolix/torrent/request-strategy"
-	"github.com/anacrolix/torrent/types"
 )
+
+// Calculate requests individually for each peer.
+const peerRequesting = false
 
 func (cl *Client) requester() {
 	for {
@@ -19,16 +22,19 @@ func (cl *Client) requester() {
 			cl.doRequests()
 			return cl.updateRequests.Signaled()
 		}()
+		minWait := time.After(100 * time.Millisecond)
+		maxWait := time.After(1000 * time.Millisecond)
 		select {
 		case <-cl.closed.Done():
 			return
-		case <-time.After(100 * time.Millisecond):
+		case <-minWait:
+		case <-maxWait:
 		}
 		select {
 		case <-cl.closed.Done():
 			return
 		case <-update:
-		case <-time.After(time.Second):
+		case <-maxWait:
 		}
 	}
 }
@@ -37,30 +43,33 @@ func (cl *Client) tickleRequester() {
 	cl.updateRequests.Broadcast()
 }
 
-func (cl *Client) doRequests() {
+func (cl *Client) getRequestStrategyInput() request_strategy.Input {
 	ts := make([]request_strategy.Torrent, 0, len(cl.torrents))
 	for _, t := range cl.torrents {
+		if !t.haveInfo() {
+			// This would be removed if metadata is handled here. We have to guard against not
+			// knowing the piece size. If we have no info, we have no pieces too, so the end result
+			// is the same.
+			continue
+		}
 		rst := request_strategy.Torrent{
-			StableId: uintptr(unsafe.Pointer(t)),
+			InfoHash:       t.infoHash,
+			ChunksPerPiece: (t.usualPieceSize() + int(t.chunkSize) - 1) / int(t.chunkSize),
 		}
 		if t.storage != nil {
 			rst.Capacity = t.storage.Capacity
 		}
+		rst.Pieces = make([]request_strategy.Piece, 0, len(t.pieces))
 		for i := range t.pieces {
 			p := &t.pieces[i]
 			rst.Pieces = append(rst.Pieces, request_strategy.Piece{
-				Request:          !t.ignorePieceForRequests(i),
-				Priority:         p.purePriority(),
-				Partial:          t.piecePartiallyDownloaded(i),
-				Availability:     p.availability,
-				Length:           int64(p.length()),
-				NumPendingChunks: int(t.pieceNumPendingChunks(i)),
-				IterPendingChunks: func(f func(types.ChunkSpec)) {
-					p.iterUndirtiedChunks(func(cs ChunkSpec) bool {
-						f(cs)
-						return true
-					})
-				},
+				Request:           !t.ignorePieceForRequests(i),
+				Priority:          p.purePriority(),
+				Partial:           t.piecePartiallyDownloaded(i),
+				Availability:      p.availability,
+				Length:            int64(p.length()),
+				NumPendingChunks:  int(t.pieceNumPendingChunks(i)),
+				IterPendingChunks: p.iterUndirtiedChunks,
 			})
 		}
 		t.iterPeers(func(p *Peer) {
@@ -74,9 +83,8 @@ func (cl *Client) doRequests() {
 			rst.Peers = append(rst.Peers, request_strategy.Peer{
 				HasPiece:    p.peerHasPiece,
 				MaxRequests: p.nominalMaxRequests(),
-				HasExistingRequest: func(r request_strategy.Request) bool {
-					_, ok := p.actualRequestState.Requests[r]
-					return ok
+				HasExistingRequest: func(r RequestIndex) bool {
+					return p.actualRequestState.Requests.Contains(r)
 				},
 				Choking: p.peerChoking,
 				PieceAllowedFast: func(i pieceIndex) bool {
@@ -84,55 +92,145 @@ func (cl *Client) doRequests() {
 				},
 				DownloadRate: p.downloadRate(),
 				Age:          time.Since(p.completedHandshake),
-				Id:           (*peerId)(p),
+				Id: peerId{
+					Peer: p,
+					ptr:  uintptr(unsafe.Pointer(p)),
+				},
 			})
 		})
 		ts = append(ts, rst)
 	}
-	nextPeerStates := request_strategy.Run(request_strategy.Input{
+	return request_strategy.Input{
 		Torrents:           ts,
 		MaxUnverifiedBytes: cl.config.MaxUnverifiedBytes,
-	})
+	}
+}
+
+func (cl *Client) doRequests() {
+	nextPeerStates := request_strategy.Run(cl.getRequestStrategyInput())
 	for p, state := range nextPeerStates {
 		setPeerNextRequestState(p, state)
 	}
 }
 
-type peerId Peer
+type peerId struct {
+	*Peer
+	ptr uintptr
+}
 
-func (p *peerId) Uintptr() uintptr {
-	return uintptr(unsafe.Pointer(p))
+func (p peerId) Uintptr() uintptr {
+	return p.ptr
 }
 
 func setPeerNextRequestState(_p request_strategy.PeerId, rp request_strategy.PeerNextRequestState) {
-	p := (*Peer)(_p.(*peerId))
+	p := _p.(peerId).Peer
 	p.nextRequestState = rp
 	p.onNextRequestStateChanged()
 }
 
+type RequestIndex = request_strategy.RequestIndex
+type chunkIndexType = request_strategy.ChunkIndex
+
 func (p *Peer) applyNextRequestState() bool {
+	if peerRequesting {
+		if p.actualRequestState.Requests.GetCardinality() > uint64(p.nominalMaxRequests()/2) {
+			return true
+		}
+		type piece struct {
+			index   int
+			endGame bool
+		}
+		var pieceOrder []piece
+		request_strategy.GetRequestablePieces(
+			p.t.cl.getRequestStrategyInput(),
+			func(t *request_strategy.Torrent, rsp *request_strategy.Piece, pieceIndex int) {
+				if t.InfoHash != p.t.infoHash {
+					return
+				}
+				if !p.peerHasPiece(pieceIndex) {
+					return
+				}
+				pieceOrder = append(pieceOrder, piece{
+					index:   pieceIndex,
+					endGame: rsp.Priority == PiecePriorityNow,
+				})
+			},
+		)
+		more := true
+		interested := false
+		for _, endGameIter := range []bool{false, true} {
+			for _, piece := range pieceOrder {
+				tp := p.t.piece(piece.index)
+				tp.iterUndirtiedChunks(func(cs chunkIndexType) {
+					req := cs + tp.requestIndexOffset()
+					if !piece.endGame && !endGameIter && p.t.pendingRequests[req] > 0 {
+						return
+					}
+					interested = true
+					more = p.setInterested(true)
+					if !more {
+						return
+					}
+					if maxRequests(p.actualRequestState.Requests.GetCardinality()) >= p.nominalMaxRequests() {
+						return
+					}
+					if p.peerChoking && !p.peerAllowedFast.Contains(bitmap.BitIndex(piece.index)) {
+						return
+					}
+					var err error
+					more, err = p.request(req)
+					if err != nil {
+						panic(err)
+					}
+				})
+				if interested && maxRequests(p.actualRequestState.Requests.GetCardinality()) >= p.nominalMaxRequests() {
+					break
+				}
+				if !more {
+					break
+				}
+			}
+			if !more {
+				break
+			}
+		}
+		if !more {
+			return false
+		}
+		if !interested {
+			p.setInterested(false)
+		}
+		return more
+	}
+
 	next := p.nextRequestState
 	current := p.actualRequestState
 	if !p.setInterested(next.Interested) {
 		return false
 	}
-	for req := range current.Requests {
-		if _, ok := next.Requests[req]; !ok {
-			if !p.cancel(req) {
-				return false
-			}
-		}
+	more := true
+	cancel := roaring.AndNot(&current.Requests, &next.Requests)
+	cancel.Iterate(func(req uint32) bool {
+		more = p.cancel(req)
+		return more
+	})
+	if !more {
+		return false
 	}
-	for req := range next.Requests {
-		more, err := p.request(req)
+	next.Requests.Iterate(func(req uint32) bool {
+		// This could happen if the peer chokes us between the next state being generated, and us
+		// trying to transmit the state.
+		if p.peerChoking && !p.peerAllowedFast.Contains(bitmap.BitIndex(req/p.t.chunksPerRegularPiece())) {
+			return true
+		}
+		var err error
+		more, err = p.request(req)
 		if err != nil {
 			panic(err)
 		} /* else {
 			log.Print(req)
 		} */
-		if !more {
-			return false
-		}
-	}
-	return true
+		return more
+	})
+	return more
 }
