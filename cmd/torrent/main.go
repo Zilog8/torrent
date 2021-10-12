@@ -212,7 +212,6 @@ func exitSignalHandlers(notify *missinggo.SynchronizedEvent) {
 }
 
 func main() {
-	defer envpprof.Stop()
 	if err := mainErr(); err != nil {
 		log.Printf("error in main: %v", err)
 		os.Exit(1)
@@ -220,6 +219,7 @@ func main() {
 }
 
 func mainErr() error {
+	defer envpprof.Stop()
 	stdLog.SetFlags(stdLog.Flags() | stdLog.Lshortfile)
 	debug := args.Flag(args.FlagOpt{Long: "debug"})
 	p := args.ParseMain(
